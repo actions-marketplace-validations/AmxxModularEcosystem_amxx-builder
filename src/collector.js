@@ -2,13 +2,15 @@ const fs   = require('fs');
 const path = require('path');
 const glob = require('fast-glob');
 const logger = require('./logger');
+const { repoKey } = require('./deps-resolver');
 
 /**
  * Copies everything from each repo's amxmodx_dir into build/amxmodx/,
  * then merges local amxmodx/ and assets/ directories (next to amxbuild.yml).
  *
- * .sma files are NOT copied — they are compiled; .amxx output is written by the
- * compiler step that runs after this one, overwriting any pre-built plugins.
+ * .sma files ARE copied as-is (like any other file); the compiler step
+ * recompiles them and overwrites the .amxx outputs. Exclude sources from a
+ * repo via its exclude_files patterns if they should not be shipped.
  *
  * Repo-vs-repo file conflicts are handled according to output.on_conflict:
  *   last_wins  (default) — later repo in list wins, warning emitted
@@ -26,7 +28,7 @@ async function collectAll(manifest, repoLocalDirs, buildDir) {
 
   // Copy from each remote repo
   for (const repoConfig of manifest.repos) {
-    const repoDir = repoLocalDirs[`${repoConfig.repo}@${repoConfig._resolvedRef || repoConfig.ref || 'HEAD'}`];
+    const repoDir = repoLocalDirs[repoKey(repoConfig)];
     const srcDir  = path.join(repoDir, repoConfig.amxmodx_dir);
 
     if (!fs.existsSync(srcDir)) {

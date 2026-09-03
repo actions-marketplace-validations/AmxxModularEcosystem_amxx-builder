@@ -1,12 +1,10 @@
 const fs   = require('fs');
 const yaml = require('js-yaml');
 const path = require('path');
-const Ajv     = require('ajv');
-const addFormats = require('ajv-formats');
+
+const { validateManifest: validateSchema } = require('./schema');
 
 const DEFAULTS_PATH  = path.join(__dirname, '..', 'defaults', 'amxbuild.defaults.yml');
-const SCHEMA_PATH    = path.join(__dirname, '..', 'schema', 'amxbuild.schema.json');
-const SCHEMA_CACHE   = loadSchemaOnce();
 
 function loadDefaultsRaw() {
   if (!fs.existsSync(DEFAULTS_PATH)) return {};
@@ -27,24 +25,10 @@ function deepMerge(base, overlay) {
   return overlay;
 }
 
-function loadSchemaOnce() {
-  try {
-    if (!fs.existsSync(SCHEMA_PATH)) return null;
-    return JSON.parse(fs.readFileSync(SCHEMA_PATH, 'utf8'));
-  } catch { return null; }
-}
-
 function validateManifest(raw) {
-  if (!SCHEMA_CACHE) return;
-  const ajv = new Ajv({ allErrors: true });
-  addFormats(ajv);
-  const validate = ajv.compile(SCHEMA_CACHE);
-  const valid = validate(raw);
-  if (!valid) {
-    const errors = validate.errors.map(e => {
-      const path = e.instancePath || '(root)';
-      return `  ${path}: ${e.message}`;
-    });
+  const result = validateSchema(raw);
+  if (!result.valid) {
+    const errors = result.errors.map(e => `  ${e.path}: ${e.message}`);
     throw new Error(`Manifest validation failed:\n${errors.join('\n')}`);
   }
 }
@@ -66,6 +50,7 @@ function parseManifest(manifestPath) {
   const tokenEnv = gh.token_env || 'GITHUB_TOKEN';
   const token    = process.env[tokenEnv] || null;
   const ssh      = !!gh.ssh;
+  const tokens   = parseTokenMap(gh.tokens);
 
   const globalPostfix = raw.plugins_ini_postfix != null ? String(raw.plugins_ini_postfix) : '';
   const globalAmxDir  = (raw.amxmodx && raw.amxmodx.dir) || 'amxmodx';
@@ -86,7 +71,7 @@ function parseManifest(manifestPath) {
         ? raw.amxmodx.defines.map(String)
         : [],
     },
-    github: { token_env: tokenEnv, token, ssh },
+    github: { token_env: tokenEnv, tokens, token, ssh },
     globalDeps,
     globalPostfix,
     repos,
@@ -122,6 +107,40 @@ function validateOnConflict(val) {
   return val;
 }
 
+function parseTokenMap(map) {
+  if (map == null) return {};
+  if (typeof map !== 'object' || Array.isArray(map)) {
+    throw new Error(`manifest: github.tokens must be a map of owner → env var name`);
+  }
+  const result = {};
+  for (const [owner, envName] of Object.entries(map)) {
+    if (envName == null || String(envName).trim() === '') {
+      throw new Error(`manifest: github.tokens.${owner} must name an env variable`);
+    }
+    result[String(owner).trim()] = interpolateEnv(String(envName).trim());
+  }
+  return result;
+}
+
+/**
+ * Resolve the GitHub token for a specific "owner/repo" path.
+ *
+ * Priority:
+ *   1. github.tokens[owner]   — per-owner env var (e.g. GITHUB_TOKEN_ORGA)
+ *   2. github.token_env       — global token env var (default "GITHUB_TOKEN")
+ *   3. null                   — anonymous (public repos)
+ *
+ * @param {object} manifest — parsed manifest
+ * @param {string} repoPath — "owner/repo" or any string starting with the owner
+ * @returns {string|null}
+ */
+function resolveGithubToken(manifest, repoPath) {
+  const gh     = manifest.github || {};
+  const owner  = String(repoPath || '').split('/')[0];
+  const envName = (gh.tokens && gh.tokens[owner]) || gh.token_env || 'GITHUB_TOKEN';
+  return process.env[envName] || null;
+}
+
 function parseRepoEntry(r, globalPostfix, globalAmxDir) {
   // Shorthand: "owner/repo" or "owner/repo@ref"
   if (typeof r === 'string') {
@@ -146,30 +165,70 @@ function makeRepo(r, globalPostfix, globalAmxDir) {
   };
 }
 
+/**
+ * Dep string shorthand: "owner/repo@ref[:include_path]".
+ * Strict — rejects internal whitespace in the repo and ref parts.
+ */
+const DEP_STRING_RE = /^([^@\s]+)@([^:\s]+)(?::(.+))?$/;
+
+/**
+ * Parse a long-form dep object (manifest `deps` entries).
+ *
+ * @param {object} line
+ * @returns {{ repo: string, ref: string, include_path: string|null, source: string, asset: * }}
+ */
+function parseDepObject(line) {
+  if (!line.repo) throw new Error(`Dep entry missing "repo": ${JSON.stringify(line)}`);
+  if (!line.ref)  throw new Error(`Dep entry missing "ref": ${JSON.stringify(line)}`);
+  const source = line.source || 'git';
+  if (!['git', 'release'].includes(source)) {
+    throw new Error(`Dep entry "source" must be "git" or "release": ${JSON.stringify(line)}`);
+  }
+  return {
+    repo:         String(line.repo).trim(),
+    ref:          String(line.ref).trim(),
+    include_path: line.include_path ? String(line.include_path).trim() : null,
+    source,
+    asset:        line.asset != null ? line.asset : null,
+  };
+}
+
+/**
+ * Strict parse of a SINGLE dep string: "owner/repo@ref[:include_path]".
+ *
+ * @param {string} str
+ * @returns {{ repo: string, ref: string, include_path: string|null, source: string, asset: null }}
+ */
+function parseDepString(str) {
+  const trimmed = String(str).trim();
+  const match = trimmed.match(DEP_STRING_RE);
+  if (!trimmed || !match) {
+    throw new Error(
+      `Invalid dep string: "${trimmed}". Expected format: "owner/repo@ref" or "owner/repo@ref:include_path"`
+    );
+  }
+  const [, repo, ref, includePath] = match;
+  return {
+    repo:         repo.trim(),
+    ref:          ref.trim(),
+    include_path: includePath ? includePath.trim() : null,
+    source:       'git',
+    asset:        null,
+  };
+}
+
 function parseDepsLines(lines) {
   const result = [];
   for (const line of lines) {
     // Long-form object (manifest only — DEPS_LIST files are always strings)
     if (line && typeof line === 'object') {
-      if (!line.repo) throw new Error(`Dep entry missing "repo": ${JSON.stringify(line)}`);
-      if (!line.ref)  throw new Error(`Dep entry missing "ref": ${JSON.stringify(line)}`);
-      const source = line.source || 'git';
-      if (!['git', 'release'].includes(source)) {
-        throw new Error(`Dep entry "source" must be "git" or "release": ${JSON.stringify(line)}`);
-      }
-      result.push({
-        repo:         String(line.repo).trim(),
-        ref:          String(line.ref).trim(),
-        include_path: line.include_path ? String(line.include_path).trim() : null,
-        source,
-        asset:        line.asset != null ? line.asset : null,
-      });
+      result.push(parseDepObject(line));
       continue;
     }
     // Short-form string: "owner/repo@ref[:include_path]"  (always git)
     const trimmed = String(line).trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
-    const match = trimmed.match(/^([^@]+)@([^:]+)(?::(.+))?$/);
+    const match = trimmed.match(DEP_STRING_RE);
     if (!match) throw new Error(`Invalid dep entry: "${trimmed}"`);
     const [, repoPath, ref, includePath] = match;
     result.push({
@@ -272,4 +331,43 @@ function parseDeploy(raw) {
   };
 }
 
-module.exports = { parseManifest, parseDepsLines };
+// ─── Manifest overrides ────────────────────────────────────────────────────────
+
+function applyOverrides(manifest, pairs) {
+  for (const pair of pairs) {
+    const eqIdx = pair.indexOf('=');
+    if (eqIdx === -1) throw new Error(`--set: invalid format "${pair}" (expected key=value)`);
+    const keys  = pair.slice(0, eqIdx).trim().split('.');
+    const value = parseOverrideValue(pair.slice(eqIdx + 1));
+    let node = manifest;
+    for (let i = 0; i < keys.length - 1; i++) {
+      if (node[keys[i]] == null) node[keys[i]] = {};
+      node = node[keys[i]];
+    }
+    node[keys[keys.length - 1]] = value;
+  }
+}
+
+function parseOverrideValue(str) {
+  if (str === 'true')  return true;
+  if (str === 'false') return false;
+  if (str === 'null')  return null;
+  if (/^\d+$/.test(str)) return parseInt(str, 10);
+  return str;
+}
+
+function resolveManifest(manifestPath, options = {}) {
+  const manifest = parseManifest(manifestPath);
+
+  if (options.set && options.set.length > 0) {
+    applyOverrides(manifest, options.set);
+  }
+
+  if (options.define && options.define.length > 0) {
+    manifest.amxmodx.defines.push(...options.define);
+  }
+
+  return manifest;
+}
+
+module.exports = { parseManifest, parseDepsLines, parseDepString, parseDepObject, applyOverrides, parseOverrideValue, resolveManifest, resolveGithubToken, loadDefaultsRaw, deepMerge };

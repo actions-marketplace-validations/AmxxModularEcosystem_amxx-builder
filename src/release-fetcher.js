@@ -1,12 +1,15 @@
 const fs   = require('fs');
 const path = require('path');
 const axios = require('axios');
+// Default for API calls; download sites pass their own longer timeout.
+axios.defaults.timeout = 30000;
 const AdmZip = require('adm-zip');
-const { execSync } = require('child_process');
 const chalk = require('chalk');
 const logger = require('./logger');
 const { getCacheDir } = require('./cache-dir');
+const { safeExtractTar } = require('./fs-utils');
 const { withRetry } = require('./retry');
+const { resolveRefIfLatest } = require('./repo-fetcher');
 
 /**
  * Downloads a GitHub release asset and extracts it locally.
@@ -35,8 +38,14 @@ async function getReleaseCacheDir(source, token, noFetch) {
 }
 
 async function ensureReleaseCacheDir(repo, ref, assetSelector, token, noFetch, label) {
-  const resolvedRef  = await resolveReleaseTag(repo, ref, token);
-  const cacheKey     = repo.replace('/', '__') + '__' + resolvedRef.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const resolvedRef  = await resolveRefIfLatest(ref, repo, token);
+  // Include the asset selector in the key: the same repo@tag with different
+  // assets must not share a cache dir (first-extracted content would win).
+  const assetKey = assetSelector == null ? '' : '--' + String(assetSelector).replace(/[^a-zA-Z0-9._-]/g, '_');
+  // Lazy require: deps-resolver imports us, so a top-level import would cycle.
+  const { normalize } = require('./deps-resolver');
+  const cacheKey = normalize(repo).replace('/', '__') + '__' +
+    resolvedRef.replace(/[^a-zA-Z0-9._-]/g, '_') + assetKey;
   const cacheDir     = path.join(getCacheDir(), 'release-deps', cacheKey);
   const sentinelFile = path.join(cacheDir, '.extracted');
 
@@ -66,26 +75,12 @@ async function ensureReleaseCacheDir(repo, ref, assetSelector, token, noFetch, l
   await downloadAsset(asset.browser_download_url, archivePath, headers);
   extractArchive(archivePath, cacheDir);
   fs.rmSync(archivePath, { force: true });
-  fs.writeFileSync(sentinelFile, resolvedRef, 'utf8');
+  const sentinelTmp = sentinelFile + '.tmp';
+  fs.writeFileSync(sentinelTmp, resolvedRef, 'utf8');
+  fs.renameSync(sentinelTmp, sentinelFile);
 
   logger.info(`${label}: ${repo}@${resolvedRef} ready`);
   return cacheDir;
-}
-
-async function resolveReleaseTag(repo, ref, token) {
-  if (ref !== 'latest') return ref;
-  logger.dim(`  ${repo}: resolving latest release tag...`);
-  const headers = buildHeaders(token);
-  try {
-    const { data } = await axios.get(
-      `https://api.github.com/repos/${repo}/releases/latest`,
-      { headers }
-    );
-    logger.dim(`  ${repo}: latest = ${data.tag_name}`);
-    return data.tag_name;
-  } catch (err) {
-    throw new Error(`Failed to resolve latest release for ${repo}: ${err.message}`);
-  }
 }
 
 async function fetchRelease(repo, tag, headers) {
@@ -170,9 +165,12 @@ async function downloadAsset(url, dest, headers) {
 
   const response = await withRetry(
     () => axios.get(url, {
-      headers: { ...headers, Accept: 'application/octet-stream' },
+      // Default to octet-stream but let callers override (API tarball fallback
+      // needs application/vnd.github+json).
+      headers: { Accept: 'application/octet-stream', ...headers },
       responseType: 'arraybuffer',
       maxRedirects: 5,
+      timeout: 600000, // large assets — allow slow links, still bound hangs
       onDownloadProgress: (e) => {
         if (bar && e.total) {
           bar.update(Math.round(e.loaded / e.total * 100));
@@ -182,16 +180,29 @@ async function downloadAsset(url, dest, headers) {
     { label: filename }
   );
   if (bar) bar.stop();
-  fs.writeFileSync(dest, Buffer.from(response.data));
+  const part = dest + '.part';
+  fs.writeFileSync(part, Buffer.from(response.data));
+  fs.renameSync(part, dest);
 }
 
 function extractArchive(archivePath, destDir) {
-  if (archivePath.endsWith('.zip')) {
+  if (archivePath.endsWith('.zip') || hasZipMagic(archivePath)) {
     new AdmZip(archivePath).extractAllTo(destDir, true);
   } else {
-    const flag = archivePath.endsWith('.tar.bz2') ? 'xjf' : 'xzf';
-    execSync(`tar ${flag} "${archivePath}" -C "${destDir}"`, { stdio: 'pipe' });
+    safeExtractTar(archivePath, destDir);
   }
 }
 
-module.exports = { fetchReleaseDep, getReleaseCacheDir };
+// ZIP archives start with "PK" — sniff the bytes so an asset named without
+// the .zip extension (redirects, CDNs) is still extracted correctly.
+function hasZipMagic(filePath) {
+  try {
+    const fd  = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(2);
+    fs.readSync(fd, buf, 0, 2, 0);
+    fs.closeSync(fd);
+    return buf[0] === 0x50 && buf[1] === 0x4b;
+  } catch { return false; }
+}
+
+module.exports = { fetchReleaseDep, getReleaseCacheDir, downloadAsset };

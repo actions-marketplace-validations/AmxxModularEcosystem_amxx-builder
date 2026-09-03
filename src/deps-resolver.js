@@ -2,8 +2,8 @@ const fs   = require('fs');
 const path = require('path');
 const glob = require('fast-glob');
 const logger = require('./logger');
-const { parseDepsLines } = require('./manifest');
-const { fetchRepo } = require('./repo-fetcher');
+const { parseDepsLines, resolveGithubToken } = require('./manifest');
+const { fetchRepo, resolveRefIfLatest } = require('./repo-fetcher');
 const { fetchReleaseDep } = require('./release-fetcher');
 
 /**
@@ -13,7 +13,6 @@ const { fetchReleaseDep } = require('./release-fetcher');
  * Priority: manifest.globalDeps > repo.deps_override > DEPS_LIST file in repo root
  */
 async function resolveDeps(manifest, repoLocalDirs, noFetch, buildDir) {
-  const token  = manifest.github.token;
   const merged = new Map(); // normalised "owner/repo" → dep entry
 
   // Add repo-level deps first (lowest priority)
@@ -53,11 +52,13 @@ async function resolveDeps(manifest, repoLocalDirs, noFetch, buildDir) {
   const includeDirs = [];
 
   for (const [k, dep] of merged) {
+    const token = resolveGithubToken(manifest, dep.repo);
     let srcDir;
     if (dep.source === 'release') {
       srcDir = await fetchReleaseDep(dep, token, noFetch);
     } else {
-      const depDir = await fetchRepo(dep.repo, dep.ref, token, noFetch, manifest.github.ssh);
+      const resolvedDepRef = await resolveRefIfLatest(dep.ref, dep.repo, token);
+      const depDir = await fetchRepo(dep.repo, resolvedDepRef, token, noFetch, manifest.github.ssh);
       srcDir = resolveIncludePath(depDir, dep.include_path, dep.repo);
     }
 
@@ -105,11 +106,13 @@ function resolveIncludePath(repoDir, explicitPath, repoName) {
   return repoDir;
 }
 
+// Single source of truth for repo-name normalization (used for cache keys
+// and dedup by core modules that previously inlined repo.toLowerCase()).
+function normalize(repo) { return repo.toLowerCase(); }
+
 function repoKey(repoConfig) {
   return `${repoConfig.repo}@${repoConfig._resolvedRef || repoConfig.ref || 'HEAD'}`;
 }
-
-function normalize(repo) { return repo.toLowerCase(); }
 function shortName(repo)  { return repo.split('/').pop(); }
 
 function countIncFiles(dir) {
@@ -121,4 +124,4 @@ function countIncFiles(dir) {
   return n;
 }
 
-module.exports = { resolveDeps };
+module.exports = { resolveDeps, readDepsListFile, normalize, repoKey };

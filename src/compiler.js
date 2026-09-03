@@ -1,10 +1,10 @@
 const fs    = require('fs');
 const path  = require('path');
-const chalk = require('chalk');
-const { spawn } = require('child_process');
 const glob       = require('fast-glob');
 const micromatch = require('micromatch');
 const logger = require('./logger');
+const { emit, EVENTS } = require('./events');
+const { spawnCompiler, buildIncludeArgs, buildDefineArgs } = require('./compile-utils');
 
 /**
  * Applies plugin rules to a local .sma file path (relative to scripting/).
@@ -51,7 +51,8 @@ async function compilePlugins(manifest, repoLocalDirs, compilerPath, includeDirs
   }
 
   // ── Collect all .sma tasks ─────────────────────────────────────────────────
-  const tasks = [];
+  const onConflict = manifest.output.on_conflict || 'last_wins';
+  const tasksByOut = new Map(); // outPath → task (dedupe cross-source collisions)
   for (const src of sources) {
     const { scriptingDir, exclude, postfix, label, ref, isLocal = false } = src;
 
@@ -67,13 +68,9 @@ async function compilePlugins(manifest, repoLocalDirs, compilerPath, includeDirs
     for (const ex of excluded) logger.skip(`Skipped (excluded): ${ex}`);
 
     const localIncDir = path.join(scriptingDir, 'include');
-    const includes = [];
-                                        includes.push(`-i${scriptingDir}`);
-    if (fs.existsSync(localIncDir))     includes.push(`-i${localIncDir}`);
-    if (fs.existsSync(collectedIncDir)) includes.push(`-i${collectedIncDir}`);
-    for (const d of includeDirs)        includes.push(`-i${d}`);
+    const includes = buildIncludeArgs({ scriptingDir, localIncDir, collectedIncDir, includeDirs });
 
-    const defines = (manifest.amxmodx.defines || []).map((d) => `-D${d}`);
+    const defines = buildDefineArgs(manifest.amxmodx.defines);
 
     if (logger.isVerbose()) {
       logger.verbose(`  includes: ${includes.join(', ') || '(none)'}`);
@@ -96,24 +93,39 @@ async function compilePlugins(manifest, repoLocalDirs, compilerPath, includeDirs
 
       const baseName = path.basename(smaRel);
       const outName  = smaRel.replace(/\.sma$/, '.amxx').split(path.sep).join('/');
-      tasks.push({
+      const task = {
         label, ref, postfix: taskPostfix, skipIni, baseName,
         srcPath: path.join(scriptingDir, smaRel),
         outName,
         outPath: path.join(pluginsDir, ...outName.split('/')),
         includes,
         defines,
-      });
+      };
+      const prev = tasksByOut.get(task.outPath);
+      if (prev) {
+        if (onConflict === 'error') {
+          throw new Error(`Plugin output conflict: "${outName}" — provided by both "${prev.label}" and "${label}"`);
+        }
+        if (onConflict === 'first_wins') {
+          logger.warn(`Plugin conflict (kept "${prev.label}"): ${outName}`);
+          continue;
+        }
+        logger.warn(`Plugin conflict (overwriting "${prev.label}"): ${outName}`);
+      }
+      tasksByOut.set(task.outPath, task);
     }
   }
+
+  const tasks = [...tasksByOut.values()];
 
   if (!tasks.length) return [];
 
   logger.info(`Compiling ${tasks.length} plugin(s)...`);
 
-  // ── Run all compilations in parallel ──────────────────────────────────────
-  const settled = await Promise.allSettled(
-    tasks.map((task) => runCompile(compilerPath, task))
+  // ── Run compilations with a bounded worker pool ───────────────────────────
+  const settled = await mapLimit(tasks, 8, (task) => runCompile(compilerPath, task)
+    .then((value) => ({ status: 'fulfilled', value }))
+    .catch((reason) => ({ status: 'rejected', reason }))
   );
 
   const compiled = [];
@@ -128,11 +140,7 @@ async function compilePlugins(manifest, repoLocalDirs, compilerPath, includeDirs
   }
 
   if (failed.length) {
-    for (const { task, err } of failed) {
-      logger.error(`FAILED: ${task.baseName}`);
-      const out = (err.compilerOutput || '').trim();
-      if (out) process.stderr.write(out + '\n');
-    }
+    // Per-plugin FAILED rendering is handled by the CLI renderer via EVENTS.COMPILED.
     throw new Error(
       `Compilation failed (${failed.length}/${tasks.length}): ` +
       failed.map(({ task }) => task.baseName).join(', ')
@@ -142,6 +150,19 @@ async function compilePlugins(manifest, repoLocalDirs, compilerPath, includeDirs
   return compiled;
 }
 
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function runCompile(compilerPath, task) {
   const { srcPath, outPath, outName, includes, defines, baseName, postfix, skipIni, label, ref } = task;
 
@@ -149,37 +170,18 @@ async function runCompile(compilerPath, task) {
   const args = [srcPath, `-o${outPath}`, ...includes, ...defines];
   logger.verbose(`  cmd: ${compilerPath} ${args.join(' ')}`);
 
-  const { status, output } = await spawnAsync(compilerPath, args);
+  const { status, output } = await spawnCompiler(compilerPath, args);
 
   if (status !== 0) {
+    emit(EVENTS.COMPILED, { baseName, ok: false, output, amxxName: null, repo: label, ref, outName });
     const err = new Error(`Compilation failed: ${baseName}`);
     err.compilerOutput = output;
     throw err;
   }
 
-  process.stdout.write(
-    `${chalk.bold.white('[amxx-builder]')}   ${baseName} ${dots(baseName)} ${chalk.green('OK')}\n`
-  );
+  emit(EVENTS.COMPILED, { baseName, ok: true, output, amxxName: outName, repo: label, ref, outName });
 
   return { amxxName: outName, plugins_ini_postfix: postfix, skipIni: skipIni || false, repo: label, ref };
-}
-
-function spawnAsync(cmd, args) {
-  const env = { ...process.env };
-  if (process.platform === 'linux') {
-    const compilerDir = path.dirname(cmd);
-    env.LD_LIBRARY_PATH = env.LD_LIBRARY_PATH
-      ? `${compilerDir}:${env.LD_LIBRARY_PATH}`
-      : compilerDir;
-  }
-  return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args, { windowsHide: true, env });
-    let output = '';
-    if (proc.stdout) proc.stdout.on('data', (d) => output += d);
-    if (proc.stderr) proc.stderr.on('data', (d) => output += d);
-    proc.on('close', (code) => resolve({ status: code, output }));
-    proc.on('error', reject);
-  });
 }
 
 async function findExcluded(dir, patterns) {
@@ -187,10 +189,6 @@ async function findExcluded(dir, patterns) {
   const all  = await glob('**/*.sma', { cwd: dir });
   const kept = new Set(await glob(['**/*.sma', ...patterns.map((e) => `!${e}`)], { cwd: dir }));
   return all.filter((f) => !kept.has(f)).map((f) => path.basename(f));
-}
-
-function dots(filename) {
-  return chalk.dim(' ' + '.'.repeat(Math.max(1, 42 - filename.length)) + ' ');
 }
 
 /**
@@ -210,28 +208,20 @@ async function compileSingle(manifest, smaPath, compilerPath, includeDirs, build
 
   const scriptingDir = scriptingRootDir || path.dirname(smaPath);
   const localIncDir  = path.join(scriptingDir, 'include');
-  const includes     = [];
-                                        includes.push(`-i${scriptingDir}`);
-  if (fs.existsSync(localIncDir))     includes.push(`-i${localIncDir}`);
-  if (fs.existsSync(collectedIncDir)) includes.push(`-i${collectedIncDir}`);
-  for (const d of includeDirs)        includes.push(`-i${d}`);
+  const includes = buildIncludeArgs({ scriptingDir, localIncDir, collectedIncDir, includeDirs });
 
-  const defines = (manifest.amxmodx.defines || []).map((d) => `-D${d}`);
+  const defines = buildDefineArgs(manifest.amxmodx.defines);
 
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
 
-  const { status, output } = await spawnAsync(compilerPath, [smaPath, `-o${outPath}`, ...includes, ...defines]);
+  const { status, output } = await spawnCompiler(compilerPath, [smaPath, `-o${outPath}`, ...includes, ...defines]);
 
   if (status !== 0) {
-    logger.error(`FAILED: ${baseName}`);
-    const out = (output || '').trim();
-    if (out) process.stderr.write(out + '\n');
+    emit(EVENTS.COMPILED, { baseName, ok: false, output, amxxName: null, repo: null, ref: null, outName });
     return null;
   }
 
-  process.stdout.write(
-    `${chalk.bold.white('[amxx-builder]')}   ${baseName} ${dots(baseName)} ${chalk.green('OK')}\n`
-  );
+  emit(EVENTS.COMPILED, { baseName, ok: true, output, amxxName: outName, repo: null, ref: null, outName });
   return outName;
 }
 

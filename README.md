@@ -4,6 +4,20 @@ CLI-инструмент для сборки AMX Mod X серверов. Чит�
 
 ## Установка
 
+**Через npm** (Node.js 18+):
+
+```bash
+npm i -g amxx-builder
+```
+
+Команды `amxb` и `amxx-builder` станут доступны глобально. Управление версиями — стандартное для npm:
+
+```bash
+npm i -g amxx-builder@1.5.1   # конкретная версия
+npm update -g amxx-builder    # обновить
+npm rm -g amxx-builder        # удалить
+```
+
 **Windows** (PowerShell):
 
 ```powershell
@@ -22,7 +36,29 @@ curl -fsSL https://raw.githubusercontent.com/AmxxModularEcosystem/amxx-builder/m
 $env:GITHUB_TOKEN="ghp_xxx"; irm .../install.ps1 | iex
 ```
 
-Требования: **Node.js 16+**, **git**.
+Конкретная версия (тэг, ветка, коммит):
+
+```bash
+# По умолчанию — последний релиз
+curl -fsSL https://raw.githubusercontent.com/AmxxModularEcosystem/amxx-builder/master/install.sh | bash
+
+# Конкретная версия
+AMXB_VERSION=v1.2.3 curl -fsSL https://raw.githubusercontent.com/AmxxModularEcosystem/amxx-builder/master/install.sh | bash
+```
+
+```powershell
+# По умолчанию — последний релиз
+irm https://raw.githubusercontent.com/AmxxModularEcosystem/amxx-builder/master/install.ps1 | iex
+
+# Конкретная версия
+$env:AMXB_VERSION="v1.2.3"; irm https://raw.githubusercontent.com/AmxxModularEcosystem/amxx-builder/master/install.ps1 | iex
+```
+
+Требования: **Node.js 18+**. git не требуется для установки и сборки — нужен только если манифест использует `github.ssh: true` (приватные репозитории по SSH-ключам).
+
+**Visual Studio Code**
+
+Расширение для VSCode - [AMXB — AMX Mod X Builder](https://marketplace.visualstudio.com/items?itemName=amxx-modular-ecosystem.amxb-vscode).
 
 ## Использование
 
@@ -43,6 +79,7 @@ amxb init                           # создать amxbuild.yml в текущ�
 amxb init --deploy                  # + создать .env с заготовками для деплоя
 amxb init --plugin <name>           # + создать amxmodx/scripting/<name>.sma
 amxb init --workflow                # + создать .github/workflows/ci.yml
+amxb init --script                  # + создать build.bat / build.sh для быстрого запуска amxb build
 
 amxb clean                          # очистить build/ и кэш клонов
 amxb clean --all                    # + кэш компилятора
@@ -226,10 +263,37 @@ deploy:
 - остальные файлы → задеплоить напрямую
 - манифест → полная пересборка
 
+## Несколько GitHub токенов
+
+Если репозитории, зависимости или release-ассеты разнесены по разным организациям, а один fine-grained PAT не может охватывать несколько организаций — укажи мапу `github.tokens` (владелец → имя env-переменной с токеном этой организации):
+
+```env
+# .env рядом с amxbuild.yml
+GITHUB_TOKEN=ghp_fallback_xxx          # fallback для всех остальных
+GITHUB_TOKEN_ORGA=github_pat_111_...
+GITHUB_TOKEN_ORGB=github_pat_222_...
+```
+
+```yaml
+github:
+  token_env: GITHUB_TOKEN          # необязательно, по умолчанию GITHUB_TOKEN
+  tokens:                          # необязательно — owner → env-переменная
+    AmxxModularEcosystem: GITHUB_TOKEN_ORGA
+    Next21Team:            GITHUB_TOKEN_ORGB
+```
+
+Резолвер для каждого `owner/repo`:
+
+1. `github.tokens[owner]` — токен организации (если owner есть в мапе);
+2. `github.token_env` (по умолчанию `GITHUB_TOKEN`) — глобальный токен;
+3. иначе — анонимный доступ (публичные репо).
+
+Мапа применяется ко всему: репозитории из `repos:`, зависимости (`deps`/`DEPS_LIST`/`deps_override`), GitHub release-ассеты в `assets.sources` и команда `amxb deps-tree`. Для транзитивных зависимостей токен подбирается по владельцу автоматически.
+
 ## GitHub Actions
 
 ```yaml
-uses: AmxxModularEcosystem/amxx-builder@v0
+uses: AmxxModularEcosystem/amxx-builder@v1
 ```
 
 ### Инпуты
@@ -288,19 +352,19 @@ jobs:
       sha:  ${{ steps.sha.outputs.SHORT }}
       name: ${{ steps.build.outputs.name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - id: sha
         run: echo "SHORT=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - id: build
-        uses: AmxxModularEcosystem/amxx-builder@v0
+        uses: AmxxModularEcosystem/amxx-builder@v1
         with:
           set: |
             output.pack=false
             output.dir=./artifact
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ steps.build.outputs.name }}-${{ steps.sha.outputs.SHORT }}-dev
           path: artifact/
@@ -314,7 +378,7 @@ jobs:
       github.event.action == 'published' &&
       startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: ${{ needs.build.outputs.name }}-${{ needs.build.outputs.sha }}-dev
           path: artifact/
@@ -333,9 +397,23 @@ jobs:
 
 ```yaml
       - id: build
-        uses: AmxxModularEcosystem/amxx-builder@v0
+        uses: AmxxModularEcosystem/amxx-builder@v1
         with:
           github-token: ${{ secrets.MY_PAT }}
+```
+
+Несколько организаций — передай секреты через `env:` и пропиши мапу через инпут `set`:
+
+```yaml
+      - id: build
+        uses: AmxxModularEcosystem/amxx-builder@v1
+        env:
+          GITHUB_TOKEN_ORGA: ${{ secrets.TOKEN_ORGA }}
+          GITHUB_TOKEN_ORGB: ${{ secrets.TOKEN_ORGB }}
+        with:
+          set: |
+            github.tokens.AmxxModularEcosystem=GITHUB_TOKEN_ORGA
+            github.tokens.Next21Team=GITHUB_TOKEN_ORGB
 ```
 
 ## Локальная сборка (замена build.bat)
@@ -375,6 +453,27 @@ repos:
 
 Все доступные опции: [`example/amxbuild.yml`](example/amxbuild.yml).
 
+## MCP сервер
+
+MCP сервер предоставляет агенту opencode информацию о публичном интерфейсе зависимостей AMX Mod X и стандартной библиотеки. Подробная документация — в [`docs/mcp/INDEX.md`](docs/mcp/INDEX.md).
+
+Подключение в opencode:
+
+```json
+{
+  "mcp": {
+    "amxx-dep-resolver": {
+      "type": "local",
+      "command": ["amxb", "mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+**Все 11 инструментов** — от просмотра `.inc` файлов до построения дерева зависимостей —
+описаны в [`docs/mcp/INDEX.md`](docs/mcp/INDEX.md) с таблицей и ссылками на полную документацию каждого инструмента.
+
 ## Приоритеты
 
 | Что | Порядок (↑ выше) |
@@ -385,3 +484,20 @@ repos:
 | ассеты | порядок в `sources:` + `on_conflict` |
 | версия компилятора | `amxmodx.version` → последний релиз |
 | значения манифеста | `--set` → манифест проекта → `defaults/amxbuild.defaults.yml` |
+
+## Устранение неполадок
+
+### `no such file or directory: ./amxxpc`
+
+Если файл `./amxxpc` существует и имеет права на исполнение (`chmod +x amxxpc`), но вы всё равно получаете ошибку **"No such file or directory"** при его запуске, скорее всего, в вашей 64-битной системе Linux отсутствуют 32-битные библиотеки.
+`amxxpc` — это 32-битный исполняемый файл, которому требуется поддержка 32-битной архитектуры (`i386`).
+
+#### Решение: Установите поддержку 32-битной архитектуры
+
+**Ubuntu / Debian / WSL:**
+
+```bash
+sudo dpkg --add-architecture i386
+sudo apt update
+sudo apt install libc6:i386 libstdc++6:i386
+```

@@ -20,6 +20,10 @@ function makePacket(str) {
 }
 
 async function sendRcon({ host, port, password, command }, timeoutMs = 5000) {
+  if (typeof password === 'string' && password.includes('"')) {
+    throw new Error('RCON password must not contain double quotes');
+  }
+
   return new Promise((resolve, reject) => {
     const sock = dgram.createSocket('udp4');
     let settled = false;
@@ -90,9 +94,7 @@ async function sendRconForPlugins(deployConfig, pluginNames) {
   if (!command) return;
 
   if (command.includes('{plugin}')) {
-    for (const name of pluginNames) {
-      await sendRconCommand(deployConfig, name);
-    }
+    await Promise.all(pluginNames.map((name) => sendRconCommand(deployConfig, name)));
   } else {
     await sendRconCommand(deployConfig, '');
   }

@@ -4,15 +4,18 @@ const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
 const axios  = require('axios');
+// Default for API calls; download sites pass their own longer timeout.
+axios.defaults.timeout = 30000;
 const AdmZip = require('adm-zip');
-const { execSync } = require('child_process');
 
 const chalk = require('chalk');
+const { safeExtractTar } = require('./fs-utils');
 const logger = require('./logger');
 const { getCacheDir }        = require('./cache-dir');
 const { withRetry }          = require('./retry');
 const { getAmxmodxFullDir, getHostPlatform } = require('./compiler-fetcher');
 const { getReleaseCacheDir } = require('./release-fetcher');
+const { resolveGithubToken } = require('./manifest');
 
 /**
  * Processes all asset sources defined in manifest.assets.sources in order.
@@ -67,7 +70,7 @@ async function resolveSource(source, manifest, manifestDir, buildDir, noFetch) {
     return getAmxmodxFullDir(version, platform);
   }
   if (source.type === 'release') {
-    return getReleaseCacheDir(source, manifest.github.token, noFetch);
+    return getReleaseCacheDir(source, resolveGithubToken(manifest, source.repo), noFetch);
   }
   return resolveUrlSource(source, manifestDir, buildDir, noFetch);
 }
@@ -97,6 +100,7 @@ async function resolveUrlSource(source, manifestDir, buildDir, noFetch) {
       () => axios.get(source.url, {
         responseType: 'arraybuffer',
         maxRedirects: 5,
+        timeout: 600000, // large archives — allow slow links, still bound hangs
         onDownloadProgress: (e) => {
           if (bar && e.total) {
             bar.update(Math.round(e.loaded / e.total * 100));
@@ -112,14 +116,22 @@ async function resolveUrlSource(source, manifestDir, buildDir, noFetch) {
     if (isArchive(filename, contentType)) {
       extractArchive(data, filename, cacheDir);
     } else {
-      fs.writeFileSync(path.join(cacheDir, filename), data);
+      const filePath = path.join(cacheDir, filename);
+      const part     = filePath + '.part';
+      fs.writeFileSync(part, data);
+      fs.renameSync(part, filePath);
     }
 
-    fs.writeFileSync(sentinel, JSON.stringify({ url: source.url, cached_at: new Date().toISOString() }));
+    const sentinelTmp = sentinel + '.tmp';
+    fs.writeFileSync(sentinelTmp, JSON.stringify({ url: source.url, cached_at: new Date().toISOString() }));
+    fs.renameSync(sentinelTmp, sentinel);
     logger.info(`Assets: ${filename} ready`);
     return cacheDir;
   } catch (err) {
-    fs.rmSync(cacheDir, { recursive: true, force: true });
+    // Never rmSync the whole cache dir: it may be a shared 'global' entry used
+    // by parallel sources or other projects. Invalidate the sentinel only and
+    // leave the content to be overwritten on the next fetch.
+    try { fs.rmSync(sentinel, { force: true }); } catch (_) {}
     throw new Error(`Failed to fetch asset ${source.url}: ${err.message}`);
   }
 }
@@ -134,7 +146,10 @@ function getCacheDirForUrl(url, cacheType, manifestDir, buildDir) {
 // ─── archive detection & extraction ──────────────────────────────────────────
 
 function getFilenameFromUrl(url) {
-  try { return path.basename(new URL(url).pathname) || 'download'; } catch { return 'download'; }
+  try {
+    const base = path.basename(new URL(url).pathname) || 'download';
+    try { return decodeURIComponent(base); } catch { return base; }
+  } catch { return 'download'; }
 }
 
 function isArchive(filename, contentType) {
@@ -143,18 +158,24 @@ function isArchive(filename, contentType) {
 }
 
 function extractArchive(data, filename, destDir) {
-  if (/\.zip$/i.test(filename)) {
+  const isZip = /\.zip$/i.test(filename) || isZipMagic(data);
+  if (isZip) {
     new AdmZip(data).extractAllTo(destDir, true);
     return;
   }
   const tmpFile = path.join(destDir, filename);
   fs.writeFileSync(tmpFile, data);
-  const flag = /\.bz2$/i.test(filename) ? 'xjf' : 'xzf';
   try {
-    execSync(`tar ${flag} "${tmpFile}" -C "${destDir}"`, { stdio: 'pipe' });
+    safeExtractTar(tmpFile, destDir);
   } finally {
     fs.rmSync(tmpFile, { force: true });
   }
+}
+
+// ZIP archives start with "PK" — filename extensions are unreliable for
+// CDN/redirect URLs, so sniff the actual bytes when the name is inconclusive.
+function isZipMagic(buf) {
+  return buf.length >= 2 && buf[0] === 0x50 && buf[1] === 0x4b;
 }
 
 // ─── map application ──────────────────────────────────────────────────────────
@@ -207,6 +228,9 @@ function applyMapEntry(baseDir, destBase, { from, to }, label, onConflict, origi
     const relKey = path.relative(destBase, fileDest).replace(/\\/g, '/');
     if (origins.has(relKey)) {
       const prev = origins.get(relKey);
+      if (onConflict === 'error') {
+        throw new Error(`Asset conflict: "${relKey}" — provided by both "${prev}" and "${label}"`);
+      }
       if (onConflict === 'first_wins') {
         logger.warn(`Asset conflict (kept "${prev}"): ${relKey}`);
         return;
@@ -233,6 +257,9 @@ function copyDirWithConflict(srcDir, destDir, trackBase, label, onConflict, orig
       const relKey = path.relative(trackBase, destPath).replace(/\\/g, '/');
       if (origins.has(relKey)) {
         const prev = origins.get(relKey);
+        if (onConflict === 'error') {
+          throw new Error(`Asset conflict: "${relKey}" — provided by both "${prev}" and "${label}"`);
+        }
         if (onConflict === 'first_wins') {
           logger.warn(`Asset conflict (kept "${prev}"): ${relKey}`);
           continue;
